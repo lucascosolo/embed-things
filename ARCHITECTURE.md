@@ -7,10 +7,10 @@ Companion documents: [PRODUCT_SPEC.md](PRODUCT_SPEC.md), [ROADMAP.md](ROADMAP.md
 
 ## 1. Principles
 
-1. **The sandbox is the security boundary.** We never rely on inspecting, linting, or AI-reviewing code to keep users safe. Every Thing is treated as hostile. Review exists to enforce *content policy*, not for *containment*.
+1. **The sandbox is the security boundary.** We never rely on inspecting or linting code to keep users safe. Every Thing is treated as hostile. Review exists to enforce *content policy*, not for *containment*.
 2. **Content is immutable, and only moderation state changes.** A Thing's source and knob values never change after publishing. The only mutable fields are `status` (live/removed/deleted) and the denormalised `remix_count`. Sources can therefore be cached aggressively, with explicit purges on takedown.
 3. **The cheapest request never reaches the database.** The player shell is static, and Thing sources are content-addressed and edge-cached. Hot-path dynamic work is limited to one small metadata read and event writes.
-4. **AI is an optional, bounded, stateless service.** No AI call sits on the viewing path, and the loop still works (knobs, source editor) with AI switched off.
+4. **No third-party runtime dependencies in the loop.** Viewing, remixing, and publishing depend only on our Worker and database. The MVP has no AI and calls no external model (PRODUCT_SPEC §8).
 5. **Keep M0 minimal.** One vendor (Cloudflare), one language (TypeScript), one Worker, and one data store (D1). Other services are added only when a milestone needs them.
 6. **Keep future contracts stable, but don't build them early.** Link shapes and the format version are fixed from day one because third parties will depend on them later. The API, embed, and SDK surfaces are not built yet.
 
@@ -25,7 +25,6 @@ Companion documents: [PRODUCT_SPEC.md](PRODUCT_SPEC.md), [ROADMAP.md](ROADMAP.md
                      │   GET  /                 home (seed grid)                   │
                      │   GET  /t/:id            player HTML + inlined metadata + OG│
                      │   GET  /t/:id/remix      editor                             │
-                     │   POST /api/v1/ai/edit   AI edit (Turnstile-verified session)│
                      │   POST /api/v1/things    publish                            │
                      │   POST /api/v1/events    measurement events (batched)       │
                      │   POST /api/v1/reports, DELETE /api/v1/things/:id           │
@@ -34,13 +33,13 @@ Companion documents: [PRODUCT_SPEC.md](PRODUCT_SPEC.md), [ROADMAP.md](ROADMAP.md
                      │   domain; no cookies, no API, no secrets exposed)           │
                      │   GET  /r/:sha           prelude + published source         │
                      │   GET  /loader           prelude + draft loader (editor)    │
-                     └───────────────┬───────────────────────────────┬─────────────┘
-                                     │                               │
-                            ┌────────▼─────────┐            ┌────────▼────────┐
-                            │ D1 (SQLite)      │            │ Anthropic API   │
-                            │ things, blobs,   │            │ (server-held key│
-                            │ sessions, events,│            │  via Worker only)│
-                            │ counters, flags  │            └─────────────────┘
+                     └───────────────┬─────────────────────────────────────────────┘
+                                     │
+                            ┌────────▼─────────┐
+                            │ D1 (SQLite)      │
+                            │ things, blobs,   │
+                            │ sessions, events,│
+                            │ counters, flags  │
                             └──────────────────┘
   Also used: Turnstile (bot check), Rate Limiting binding (bursts), cache + zone purge API.
 ```
@@ -50,7 +49,7 @@ One Worker on two hostnames means one deploy and one config. Isolation comes fro
 ## 3. The Thing format (`thing/0`)
 
 ### 3.1 Shape
-A Thing's **source** is one UTF-8 HTML document of at most **32 KB**. AI-authored toys are typically 4–15 KB. The cap keeps loads fast, keeps AI inputs bounded (about 10 k tokens or fewer), and keeps storage trivial. The source embeds a manifest:
+A Thing's **source** is one UTF-8 HTML document of at most **32 KB**. Hand-written toys are typically 4–15 KB. The cap keeps loads fast, keeps review manageable, and keeps storage trivial. The source embeds a manifest:
 
 ```html
 <!doctype html>
@@ -94,7 +93,7 @@ A Thing's **source** is one UTF-8 HTML document of at most **32 KB**. AI-authore
   The WebRTC caveat is covered in §5.4.
 
 ### 3.2 A published Thing = source blob + knob values + metadata
-Knob **values** are stored apart from the source. A knob-only remix reuses its parent's source blob (same hash) and stores only new values. The most common remix therefore costs nothing in AI or storage, and "what changed" is an exact structured diff. The side effect: **one source blob can be shared by many Things** (this matters for takedowns, §7).
+Knob **values** are stored apart from the source. A knob-only remix reuses its parent's source blob (same hash) and stores only new values. The most common remix therefore adds almost nothing to storage, and "what changed" is an exact structured diff. The side effect: **one source blob can be shared by many Things** (this matters for takedowns, §7).
 
 ### 3.3 Versioning
 `format` is required, and unknown major versions render as a placeholder. `thing/0` is explicitly **unstable** during M0–M2 and becomes the stable, published `thing/1` at M3. Things reference blobs by hash and keep metadata separately, so a migration can rewrite old sources into new blobs.
@@ -102,10 +101,10 @@ Knob **values** are stored apart from the source. A knob-only remix reuses its p
 ### 3.4 Why HTML rather than a custom DSL or engine
 | Option | Verdict |
 |---|---|
-| **Single-file HTML + JS in a hard browser sandbox** (chosen) | Maximum expressiveness. LLMs are fluent in it, and there's no custom engine to build. A Thing is a file that runs anywhere under the same policy. Safety rests on the browser sandbox, the most heavily attacked and patched isolation layer available. |
-| Declarative DSL / JSON scene graph | Safer by construction, but it needs an engine, an editor, and teaching the LLM a new language. That's months of work before any validation, and expressiveness is capped. Rejected for now; possible later as an optional authoring layer that compiles to HTML. |
+| **Single-file HTML + JS in a hard browser sandbox** (chosen) | Maximum expressiveness. Every web developer already knows it, and there's no custom engine to build. A Thing is a file that runs anywhere under the same policy. Safety rests on the browser sandbox, the most heavily attacked and patched isolation layer available. |
+| Declarative DSL / JSON scene graph | Safer by construction, but it needs an engine, an editor, and a new language for creators to learn. That's months of work before any validation, and expressiveness is capped. Rejected for now; possible later as an optional authoring layer that compiles to HTML. |
 | JS in a WASM interpreter (e.g. QuickJS) with a custom draw API | Strong isolation, and it could render in native SDKs without a webview. But there's no DOM, the API is custom, and Things would be more limited. Recorded as an M4+ option for native rendering. |
-| Fixed templates with parameters only | Safe and trivial, but it can't test whether AI-assisted changes matter. Rejected. |
+| Fixed templates with parameters only | Safe and trivial, but new kinds of Things could only come from the team, so remix chains couldn't evolve beyond knob settings. Rejected; the knobs are kept, the source stays open. |
 
 ## 4. Rendering
 
@@ -134,7 +133,7 @@ Drafts are **never stored or served by URL**:
 2. The host posts `{load: {source, knobs, nonce}}`. The loader accepts it only from `window.parent` and only once. It then writes the source into its own document with `document.open()`/`document.write()`. The document keeps its CSP and sandbox, and the prelude has already run.
 3. The prelude posts `ready {nonce}`, and the host checks the nonce the same way as the sha in §4.1.
 4. **Knob changes** are sent as a `knobs` message. If the Thing registered `thing.on("knobs")`, it updates live. Otherwise the host reloads the loader and re-sends the source with the new knob values. The URL never changes, so no browser history entries pile up.
-5. **Code changes** (AI or hand edits) reload the loader with the new source.
+5. **Source edits** (desktop) reload the loader with the new source.
 
 > **Verification item (M-1, S1):** confirm in Chromium, WebKit, Firefox, and the target in-app browsers that the CSP and sandbox survive `document.open()`/`write()`. **Fallback if they don't:** store the draft under an unguessable, `no-store`, 24-hour URL on the content host, keyed by the session, and exclude it from the cache.
 
@@ -146,7 +145,7 @@ The bridge is deliberately tiny, and it's the only channel between host and Thin
 | Thing → host | `ready {sha \| nonce}` | First-frame timing (V7); integrity check |
 | Thing → host | `interact` (once) | First pointer or key event, from a capture-phase listener the prelude installs before author code runs (V1) |
 | Thing → host | `heartbeat` (every 1 s) | Watchdog |
-| Thing → host | `error {message, line}` | Error banner; pre-filled "Ask AI to fix" |
+| Thing → host | `error {message, line}` | Error banner in the editor; error events for measurement |
 | Host → Thing | `knobs {values}` | Live knob updates (editor) |
 | Host → Thing | `visibility {visible}` | Pause when hidden |
 | Host → Thing | `prefs {muted, reducedMotion}` | Accessibility |
@@ -167,8 +166,7 @@ If no heartbeat arrives for 3 s, the host shows "stopped responding" with Restar
 | Malicious Thing author | Steal viewer data or credentials, attack the host page, redirect viewers, mine crypto | Opaque-origin sandbox + CSP + separate domain + no network (§5.2); host-side `frame-src` limits frame navigation; sha check (§4.1) |
 | Malicious Thing author | Track viewers or leak what they type | Mostly blocked; WebRTC residual (§5.4) |
 | Malicious Thing author | Offensive, illegal, or deceptive visible content | Daily human review, reports, removal (§7) |
-| Spammer / bot | Mass publishing, AI cost abuse | Turnstile, D1 daily counters, spend cap reserved before each call (§8) |
-| Prompt injection via a Thing's source | Make the AI produce something harmful | The AI has no tools, secrets, or cross-user data; its output is a draft that runs in the same sandbox and is covered by review (§10.3) |
+| Spammer / bot | Mass publishing | Turnstile, D1 daily counters, publish kill switch (§8) |
 | Attacker loading the content host at top level | Host phishing pages on our domain | `Sec-Fetch-Dest: document` gets a 403 before the cache; CSP `sandbox` applies even at top level; the domain holds nothing of value |
 
 ### 5.2 Content-host response headers (`/r/:sha` and `/loader`)
@@ -196,7 +194,7 @@ Vary: Sec-Fetch-Dest
 Why each part is there:
 
 - **Opaque origin everywhere.** The iframe's `sandbox="allow-scripts"` plus the CSP `sandbox` directive give an opaque origin: no cookies, no storage, and no same-origin access. That holds even if the URL is loaded directly. The sandbox never grants `allow-same-origin`, `allow-top-navigation*`, `allow-popups`, `allow-forms`, `allow-modals`, `allow-downloads`, or `allow-pointer-lock`.
-- **`'unsafe-eval'` is intentional.** Inline script is already allowed, so blocking `eval` would add no security and would break some AI-written code. `script-src` still blocks remote, `data:`, and `blob:` scripts, and `worker-src 'none'` blocks workers.
+- **`'unsafe-eval'` is intentional.** Inline script is already allowed, so blocking `eval` would add no security and would break common code patterns. `script-src` still blocks remote, `data:`, and `blob:` scripts, and `worker-src 'none'` blocks workers.
 - **Separate registrable domain** (not a subdomain). There are no shared cookies or same-site privileges, and there's a reputation boundary: a bad Thing can't get the product domain blocklisted.
 - **`frame-ancestors https://things.example`.** This limits framing to our own player in M0. It is checked against *every* ancestor, so **the M1 embed feature must relax it to `*`**. After that, anyone could frame raw Things without attribution. That's acceptable because attribution isn't a security property (see ROADMAP M1).
 - **Frame self-navigation.** A Thing can still navigate its own frame (`location = …`, meta refresh). What limits the destinations is the **product host's CSP `frame-src https://thingcontent.example`**, which blocks external, `data:`, and `javascript:` destinations. The sha/nonce check (§4.1) catches navigation to other content-host documents. (The `navigate-to` directive was removed from the CSP spec and is not used.)
@@ -263,8 +261,7 @@ CREATE TABLE things (
   seed_id       TEXT NOT NULL,       -- the seed at the root of this lineage (self for seeds)
   depth         INTEGER NOT NULL,    -- 0 for seeds
   change_kind   TEXT NOT NULL,       -- 'seed' | 'knobs' | 'source'
-  change_notes  TEXT,                -- JSON array of AI one-line summaries (≤ 8); shown in M1
-  edit_counts   TEXT NOT NULL,       -- JSON {"knob":n,"ai":n,"hand":n}
+  edit_counts   TEXT NOT NULL,       -- JSON {"knob":n,"hand":n}
   aspect        TEXT NOT NULL,
   status        TEXT NOT NULL DEFAULT 'live',  -- live | removed | deleted
   rating        TEXT,                -- reserved for M2 content ratings; NULL until then
@@ -286,7 +283,7 @@ CREATE TABLE share_refs (
 
 CREATE TABLE events (                -- measurement; pruned after 180 days
   id INTEGER PRIMARY KEY, at TEXT NOT NULL, viewer_key TEXT NOT NULL,
-  kind TEXT NOT NULL,                -- view | ready | interact | editor_open | ai_edit | publish | share | error
+  kind TEXT NOT NULL,                -- view | ready | interact | editor_open | source_edit | publish | share | error
   thing_id TEXT, ref TEXT, value_ms INTEGER, detail TEXT
 );
 CREATE INDEX events_kind_at ON events(kind, at);
@@ -295,18 +292,13 @@ CREATE TABLE counters (              -- daily limits: key = '<action>:<scope>:<i
   key TEXT PRIMARY KEY, n INTEGER NOT NULL
 );
 
-CREATE TABLE ai_spend_daily (        -- global cost circuit breaker
-  day TEXT PRIMARY KEY, reserved_usd_micros INTEGER NOT NULL DEFAULT 0,
-  settled_usd_micros INTEGER NOT NULL DEFAULT 0, calls INTEGER NOT NULL DEFAULT 0
-);
-
 CREATE TABLE reports (
   id TEXT PRIMARY KEY, thing_id TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT,
   reporter_key TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT, resolution TEXT
 );
 
-CREATE TABLE flags (                 -- kill switches, changeable without a deploy
-  name TEXT PRIMARY KEY, value TEXT NOT NULL   -- publish_enabled, ai_enabled, ai_daily_cap_usd
+CREATE TABLE flags (                 -- kill switch, changeable without a deploy
+  name TEXT PRIMARY KEY, value TEXT NOT NULL   -- publish_enabled
 );
 ```
 There are no user tables, emails, or stored IP addresses. Network-scoped counters use a daily-salted hash of the IP /24 (IPv4) or /48 (IPv6), and those rows are deleted after 2 days.
@@ -344,7 +336,7 @@ At M0 volumes (hundreds to low thousands of Things; sources ≤ 32 KB), a single
 
    A cleanly removed Thing disappears from edge caches within seconds. Copies in browser caches expire within 1 day.
 4. **Self-delete:** the publishing browser can delete (matched by `creator_key`). The steps are the same, except the blob is blocked only if no other live Thing uses it.
-5. **Kill switches:** `publish_enabled` and `ai_enabled` in the `flags` table are read on each mutating request. They're changeable in seconds with one SQL statement, and no deploy is needed.
+5. **Kill switch:** `publish_enabled` in the `flags` table is read on each mutating request. They're changeable in seconds with one SQL statement, and no deploy is needed.
 6. **Legal groundwork, before the public beta (M1):**
    - ToS with a remix licence;
    - 13+ age requirement;
@@ -356,34 +348,24 @@ At M0 volumes (hundreds to low thousands of Things; sources ≤ 32 KB), a single
 
 ### 8.1 Viewer identity without accounts
 - On first view, the product host sets a random 128-bit **viewer id** in a signed, `HttpOnly; Secure; SameSite=Lax` cookie that lasts 1 year. `viewer_key = sha256(viewer id)` is what gets stored.
-- The first mutating action (AI edit, publish, report, delete) requires a **Turnstile** token. That marks the `viewer_key` as verified in `sessions`.
+- The first mutating action (publish, report, delete) requires a **Turnstile** token. That marks the `viewer_key` as verified in `sessions`.
 - There are no emails, passwords, or manage links. Deletion only works from the browser that published, or by emailing the team.
 
 ### 8.2 Limits
-Daily limits use D1 `counters`, updated with an upsert on every mutating call. (The Workers Rate Limiting binding only supports 10 s and 60 s windows, so it's used only for burst protection: 10 requests in 10 s per viewer on the AI and publish endpoints.)
+Daily limits use D1 `counters`, updated with an upsert on every mutating call. (The Workers Rate Limiting binding only supports 10 s and 60 s windows, so it's used only for burst protection: 10 requests in 10 s per viewer on the publish and report endpoints.)
 
 | Action | Per viewer / day | Per network (/24 or /48) / day | Global |
 |---|---|---|---|
-| AI edits | 20 | 60 | Daily USD cap from `flags` (alpha $25, beta $150), then AI is disabled with a message |
 | Publishes | 30 | 100 | `publish_enabled` |
 | Reports | 20 | 60 | — |
 
-**Reserve-then-settle spend cap.** Before each AI call, the Worker runs one atomic statement:
+Sources are capped at 32 KB, and titles, nicknames, and text knob values have the length limits in §3.1 and §6.1.
 
-```sql
-UPDATE ai_spend_daily SET reserved_usd_micros = reserved_usd_micros + :max_cost
-WHERE day = :today AND reserved_usd_micros + :max_cost <= :cap RETURNING …
-```
-
-`:max_cost` is the worst case: the input-token estimate plus `max_tokens`, at list price. If no row comes back, AI is off for the day. After the call, the actual cost is settled and the unused reservation released. Concurrent calls can't overshoot the cap. An alert fires at 50 % of the cap.
-
-**Input cap.** A source must be ≤ 32 KB. Requests estimated at more than 12 k input tokens are rejected, and so are instructions longer than 300 characters.
-
-**Accepted reality.** Turnstile-solving services plus residential proxies can get past the per-viewer and per-network limits. The global cap is the real backstop, and it bounds the worst case at the daily cap. The trade-off: under attack, AI goes offline for real users until the next day. Knobs keep working.
+**Accepted reality.** Turnstile-solving services plus residential proxies can get past the per-viewer and per-network limits. With no AI in the product, the worst case is spam publishing, not spending: storage per Thing is tiny, spam is link-only and nobody discovers it, and the daily review plus the kill switch contain it. There's no per-request cost for an attacker to run up.
 
 ### 8.3 Measurement
 - **Share refs.** Share and copy-link create a `share_refs` row and append `?r={ref}` to the link.
-- **Events.** The player and editor send batched events (`view`, `ready` with ms, `interact`, `editor_open`, `ai_edit`, `publish`, `share`, `error`) to `/api/v1/events`, which writes them to the D1 `events` table.
+- **Events.** The player and editor send batched events (`view`, `ready` with ms, `interact`, `editor_open`, `source_edit`, `publish`, `share`, `error`) to `/api/v1/events`, which writes them to the D1 `events` table.
 - **Analysis.** Metrics are computed with saved SQL queries (`wrangler d1 execute`, or an exported file analysed in DuckDB). M0 has no dashboard.
 - **Recipient view.** A view with a ref where `viewer_key` ≠ the ref's `sharer_key` and ≠ the Thing's `creator_key`. See PRODUCT_SPEC §10.1 for the caveats.
 - **Consent check (before the alpha).** Get a one-page legal read on whether the viewer-id cookie, used for security, rate limiting, and first-party aggregate product measurement, needs consent in the EU and UK. **Fallback if it does:**
@@ -404,93 +386,31 @@ WHERE day = :today AND reserved_usd_micros + :max_cost <= :cap RETURNING …
 - **Sharing:** the Web Share API where available, with copy-link as the fallback.
 - **Embed (M1, contract reserved now):** `https://things.example/e/{id}?autoplay=0|1`. It will always show attribution and a Remix button, and it requires relaxing the content host's `frame-ancestors` (§5.2). The path is reserved now so it's never used for anything else.
 
-## 10. AI integration
+## 10. AI: not in the MVP, and what a later experiment would need
 
-### 10.1 Boundary
-- **Where:** only in the Worker, through the Anthropic TypeScript SDK with a server-held key. Browsers never contact the model provider.
-- **Inputs:** the current source (≤ 32 KB), the user's instruction (≤ 300 chars), and optionally the last runtime error (pre-filled by "Ask AI to fix").
-- **Output:** one structured result:
-  - a list of search/replace hunks against the source (a full rewrite is allowed if the source is under 4 KB);
-  - a `summary` of ≤ 100 chars;
-  - the updated manifest.
+The MVP has no AI (PRODUCT_SPEC §8). Nothing in the architecture depends on it, and no model provider, key, or spend control is built.
 
-  The Worker applies the hunks, re-validates the size and manifest, and returns the new source and summary to the editor. The editor then previews it through the loader. Nothing is stored until publish.
-- **Stateless and tool-free.** There are no tools, no browsing, and no cross-user context. The response is a plain request/response with an indeterminate progress UI on the client (no streaming in M0).
+If the alpha shows demand for changes knobs can't make (PRODUCT_SPEC V8 and interviews), AI could be tried as an optional M1 experiment. It would fit without restructuring, because the editor already produces new sources, and new sources are just drafts previewed through the loader (§4.2). The experiment would need the following, and none of it is built before then:
 
-### 10.2 Calls in M0
-| Call | Trigger | Model | Est. tokens (in / out) |
-|---|---|---|---|
-| **Edit** | Ask AI (including "Ask AI to fix") | Chosen per §10.4 from Haiku 4.5, Sonnet 5, Opus 5.5, Opus 5 | ~7 k (~2 k cacheable system prompt) / ~1.5 k + ~1 k thinking |
+- **A server-side endpoint only.** A server-held key; browsers never contact a model provider. No tools, no browsing, and no cross-user context.
+- **Output treated as untrusted source.** Model output is a draft like any hand edit. It runs in the same sandbox and goes through the same review, so prompt injection from a remixed Thing's source can only shape a draft the requester previews.
+- **Cost controls built first:** per-viewer and per-network daily allowances, an input-size cap, and a global daily spend cap reserved atomically before each call.
+- **A quality eval** over fixed edit tasks, run under the real CSP, before any user sees it.
+- **A success criterion:** it ships beyond the experiment only if it beats knobs-only on V3 and V5 without reducing hand remixing.
 
-That's the only call. Idea chips and model-based publish review are M1.
-
-**System prompt duties:**
-- Make only the requested change.
-- Stay within the `thing/0` capabilities, and never add network, storage, or external resources.
-- Expose new tunable values as knobs.
-- Keep the source small.
-- Return an honest one-line summary.
-- Decline policy-violating requests briefly.
-
-The prompt is byte-stable so prompt caching can apply. S2 checks that it meets the model's minimum cacheable length. At alpha traffic, many calls will miss the cache's TTL, and the cost model assumes that.
-
-### 10.3 Prompt injection stance
-A Thing's source is untrusted text inside the model's context. An injected instruction can only shape the *new draft*, and that draft:
-
-- is previewed by the person who asked for it;
-- runs in the same sandbox;
-- is subject to review once published.
-
-The model sees no secrets and no other users' data. The remaining risk ("remixing X quietly adds offensive text") is handled like any other content risk.
-
-### 10.4 Quality eval and model choice
-- **Task set:** 50 fixed edit tasks over the seeds, for example "add a score", "two players on one screen", "space theme", and "fix this error".
-- **Automatic checks:** the hunks apply, the size cap holds, the manifest is valid, and the result runs for 5 s in headless Chromium **under the real CSP** with no errors.
-- **Human check:** a blind 1–5 rating of instruction-following.
-- **Pass bar:** ≥ 85 % run clean and a median rating ≥ 4.
-- **Selection rule (the same in every document):** *the cheapest model that passes the eval and keeps projected V8 ≤ $0.15*. The approver sees the measured numbers for every candidate and makes the final call.
-- **When it runs:** manually, before launch and before any model or system-prompt change. It isn't in CI, because it costs money on every run.
+For planning only, list prices in 2026-09 would put a typical small edit at about $0.02–0.09 depending on model tier. Counting sessions that never publish, that comes to about $0.06–0.32 per published Thing. That would become the product's dominant variable cost, which is one reason it's excluded until data justifies it.
 
 ## 11. Operating cost model
 
-List prices as of 2026-09:
+List prices as of 2026-09: Cloudflare Workers Paid is $5/mo and includes 10 M requests and 30 M CPU-ms. D1 includes 25 B row reads, 50 M row writes, and 5 GB. Turnstile is free.
 
-- **Cloudflare:** Workers Paid is $5/mo and includes 10 M requests and 30 M CPU-ms. D1 includes 25 B row reads, 50 M row writes, and 5 GB. Turnstile is free.
-- **Claude, per million tokens (input/output):** Haiku 4.5 $1/$5; Sonnet 5 $2/$10; Opus 5.5 $4/$20; Opus 5 $5/$25. Cache reads are about 10 % of the input price.
+| Scenario | Opens/mo | Published/mo | Worker requests/mo | D1 writes/mo | Infra cost/mo |
+|---|---|---|---|---|---|
+| Closed alpha (M0) | 10 k | 800 | ~30 k | ~30 k | $5 |
+| Public beta (M1) | 1 M | 20 k | ~3 M | ~3 M | ~$5–15 |
+| Growth (M2) | 20 M | 300 k | ~60 M | ~60 M (events move to an analytics store) | ~$50–120 (R2 + analytics store by then) |
 
-### 11.1 AI cost per edit and per published Thing (estimates; S2 replaces them with measurements)
-**Assumptions:**
-- Each edit uses 5 k uncached input, 2 k cached input, 1.5 k output, and 1 k thinking tokens.
-- AI remix sessions average 2.5 edits, including fixes.
-- 35 % of editor sessions publish (V3), and **abandoned sessions still cost money**.
-- Half of all remixes are knob-only and cost $0.
-
-| Model | $/edit | $ per published AI remix (2.5 edits ÷ 0.35) | **$ per published Thing, blended with 50 % knob-only (V8)** |
-|---|---|---|---|
-| Haiku 4.5 | $0.018 | $0.13 | **$0.06** |
-| Sonnet 5 | $0.035 | $0.25 | **$0.13** |
-| Opus 5.5 | $0.071 | $0.51 | **$0.25** |
-| Opus 5 | $0.089 | $0.63 | **$0.32** |
-
-Cache-write premiums and cache misses at low traffic add roughly 5–10 %. **Only Haiku- and Sonnet-class models meet V8 ≤ $0.15.** An Opus-class model needs V8 raised to about $0.25–0.35, or the edit allowance cut. This is the approver's decision.
-
-### 11.2 Monthly scenarios
-| Scenario | Opens/mo | Published/mo | AI edits/mo | Infra | AI @ Haiku 4.5 | AI @ Sonnet 5 | AI @ Opus 5.5 |
-|---|---|---|---|---|---|---|---|
-| Closed alpha (M0) | 10 k | 800 | 2 k | $5 | ~$40 | ~$75 | ~$150 |
-| Public beta (M1) | 1 M | 20 k | 50 k | ~$5–15 | ~$900 | ~$1.8 k | ~$3.6 k |
-| Growth (M2) | 20 M | 300 k | 600 k | ~$50–120 (R2 + analytics store by then) | ~$11 k | ~$21 k | ~$43 k |
-
-Infrastructure stays nearly flat. Viewing is served mostly from cache, at roughly 3 Worker requests and 3 event writes per open, and static assets are free. **AI is more than 90 % of variable cost at every scale.** The cost levers, in order of impact:
-
-1. Knob-first UX (free remixes).
-2. Per-viewer allowances.
-3. The model the eval allows.
-4. The size cap (bounded inputs).
-5. Prompt caching.
-6. Eventually, a Pro tier.
-
-The daily caps bound worst-case spend at $25/day in the alpha and $150/day in the beta.
+Each open costs about 3 Worker requests and 3 event writes. Sources are served from cache, and static assets are free. **There is no per-user variable cost beyond these, so the whole product runs on the $5/month base plan through the alpha.** Costs grow with views, not with creation, and stay within the included allowances until well into the beta. The main cost lever at growth scale is moving events off D1 and sampling them.
 
 ## 12. Tech stack and repository layout
 
@@ -501,11 +421,10 @@ The daily caps bound worst-case spend at $25/day in the alpha and $150/day in th
 | Routing | Hono | Small and Workers-native |
 | Player shell | Vanilla TS | ≤ 40 KB gzipped budget, because the first frame matters most |
 | Editor | Preact; a plain `<textarea>` for desktop source editing | Small, and loaded only when the user taps Remix |
-| Model API | `@anthropic-ai/sdk` | Official SDK |
-| Tests | Vitest (unit); Playwright (e2e + hostile suite on Chromium and WebKit in CI); AI eval harness (manual) | Security gates are automated; the cost-bearing eval isn't |
+| Tests | Vitest (unit); Playwright (e2e + hostile suite on Chromium and WebKit in CI) | Security gates are automated |
 
 ```
-/src/worker        Hono app: product-host routes, content-host routes, API, limits, AI
+/src/worker        Hono app: product-host routes, content-host routes, API, limits
 /src/player        player shell (vanilla TS)
 /src/editor        editor (Preact)
 /src/format        thing/0 schema, knob validation, prelude + loader source
@@ -513,7 +432,6 @@ The daily caps bound worst-case spend at $25/day in the alpha and $150/day in th
 /migrations        D1 schema
 /scripts           review list, remove, metrics SQL
 /tests/hostile     adversarial Things + Playwright suite
-/tests/ai-eval     edit-task set + harness
 ```
 
 ## 13. Path to the library, API, and SDKs (designed for, not built)
@@ -522,7 +440,8 @@ The daily caps bound worst-case spend at $25/day in the alpha and $150/day in th
 |---|---|---|
 | **Embed widget + oEmbed** | Reserved `/e/:id` path; attribution lives in the host UI. Requires `frame-ancestors *` on the content host. | M1 |
 | **Per-Thing and animated previews** | Headless render (e.g. Cloudflare Browser Rendering), only for Things above a popularity threshold | M1 |
-| **Automated review + admin UI** | The review script's logic becomes the prompt and rubric; `reports` and `status` already exist | M1 |
+| **Automated review + admin UI** | The review script's rules become the automated checks (a classifier model is one option at that point); `reports` and `status` already exist | M1 |
+| **AI-assisted editing (optional experiment)** | Drafts already flow through the loader, so model output would be just another draft; requirements in §10 | M1, only if V8 and interviews justify it |
 | **Public library and search** | `status` and `rating` columns; moderation workflow; small indexable metadata (D1 FTS5 over title and knob text is enough to start) | M2 |
 | **Public read API** (`/v1/things/:id`, `/lineage`, `/remixes`, later `/search`) | Internal `/api/v1` already uses public-shaped JSON (cursor pagination, no internal fields). New work would be API keys, quotas, and attribution terms. | M3 |
 | **Open format and player** (`thing/1` spec, open-source prelude/player for self-hosted playback) | `format` versioning, a single prelude package, and the hostile suite, which becomes the conformance suite | M3 |
